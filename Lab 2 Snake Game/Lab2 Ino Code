@@ -1,0 +1,144 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+Adafruit_MPU6050 mpu;
+
+//Pins
+const int VRx = A0;
+const int VRy = A1;
+const int Buzzer = 8;
+
+const int Joyemptyarea = 200;
+const float Tiltangle = 10.0;        
+const float Tiltemptyarea = 5.0;          
+const float Shakereq = 2.2;        
+const unsigned long Shakeinterval = 3000;
+const unsigned long Commandinterval = 200; 
+
+//States
+unsigned long Lastshaketime = 0;
+unsigned long Lastcommtime = 0;
+float neutralPitch = 0, neutralRoll = 0;
+bool neutralSet = false;
+char lastCommand = ' ';
+
+float smooth(float newVal, float oldVal, float alpha = 0.5) {
+  return alpha * newVal + (1 - alpha) * oldVal;
+}
+
+float smoothedPitch = 0, smoothedRoll = 0;
+
+void setup() {
+  Serial.begin(9600);
+  while (!Serial) delay(10);
+
+  pinMode(Buzzer, OUTPUT);
+  digitalWrite(Buzzer, LOW);
+
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 not found!");
+    while (1) delay(10);
+  }
+
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  delay(500);
+  Serial.println("MPU6050 ready");
+}
+
+void beep(unsigned int freq = 1000, unsigned int duration = 150) {
+  tone(Buzzer, freq, duration);
+}
+
+void calibrateNeutral() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  float ax = a.acceleration.x;
+  float ay = a.acceleration.y;
+  float az = a.acceleration.z;
+
+  float pitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+  float roll  = atan2(-ay, sqrt(ax * ax + az * az)) * 180.0 / PI;
+
+  neutralPitch = pitch;
+  neutralRoll = roll;
+  neutralSet = true;
+  Serial.println("Neutral calibrated");
+}
+
+void loop() {
+  //Joystick Control
+  int xValue = analogRead(VRx);
+  int yValue = analogRead(VRy);
+  char joyCmd = ' ';
+
+  if (yValue < 512 - Joyemptyarea) joyCmd = 'w';
+  else if (yValue > 512 + Joyemptyarea) joyCmd = 's';
+  else if (xValue < 512 - Joyemptyarea) joyCmd = 'a';
+  else if (xValue > 512 + Joyemptyarea) joyCmd = 'd';
+
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  if (!neutralSet) calibrateNeutral();
+
+  float ax = a.acceleration.x;
+  float ay = a.acceleration.y;
+  float az = a.acceleration.z;
+
+  float pitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+  float roll  = atan2(-ay, sqrt(ax * ax + az * az)) * 180.0 / PI;
+
+  //Smoothing
+  smoothedPitch = smooth(pitch, smoothedPitch);
+  smoothedRoll  = smooth(roll, smoothedRoll);
+
+  float dp = smoothedPitch - neutralPitch;
+  float dr = smoothedRoll - neutralRoll;
+
+  //Ignore minute changes
+  if (fabs(dp) < Tiltemptyarea) dp = 0;
+  if (fabs(dr) < Tiltemptyarea) dr = 0;
+
+  //Tilt Directions
+  char tiltCmd = ' ';
+  if (dp < -Tiltangle) tiltCmd = 'w';
+  else if (dp > Tiltangle) tiltCmd = 's';
+  else if (dr < -Tiltangle) tiltCmd = 'd';
+  else if (dr > Tiltangle) tiltCmd = 'a';
+
+  //Choosing Joystick
+  char command = (joyCmd != ' ') ? joyCmd : tiltCmd;
+
+  //Stopping direction changes
+  bool valid = true;
+  if ((lastCommand == 'w' && command == 's') ||
+      (lastCommand == 's' && command == 'w') ||
+      (lastCommand == 'a' && command == 'd') ||
+      (lastCommand == 'd' && command == 'a')) valid = false;
+
+  if (command != ' ' && valid && command != lastCommand &&
+      millis() - Lastcommtime > Commandinterval) {
+    Serial.println(command);
+    lastCommand = command;
+    Lastcommtime = millis();
+  }
+
+//Shakes
+  float totalAccel = sqrt(ax * ax + ay * ay + az * az) / 9.81;
+  if (totalAccel > Shakereq && millis() - Lastshaketime > Shakeinterval) {
+    Serial.println('B');
+    beep(1500, 200);
+    Lastshaketime = millis();
+  }
+
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == 'E') beep(1000, 150);
+    else if (c == 'N') calibrateNeutral();
+  }
+
+  delay(80);
+}
