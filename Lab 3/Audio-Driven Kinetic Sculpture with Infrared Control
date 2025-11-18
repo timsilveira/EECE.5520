@@ -1,1 +1,321 @@
+#include <Wire.h>
+#include "RTClib.h"
+#include <LiquidCrystal.h>
+#include <IRremote.h>
+#include <avr/interrupt.h>
+
+//Pins
+const int motorEnablePin = 5;
+const int motorIn1Pin = 4;
+const int motorIn2Pin = 3;
+const int directionButtonPin = 6;
+const int micAnalogPin = A0;
+const int irReceiverPin = 13;
+LiquidCrystal lcdDisplay(7, 8, 9, 10, 11, 12);
+
+//RTC
+RTC_DS1307 rtc;
+
+//Remote
+IRrecv irReceiver(irReceiverPin);
+decode_results irResults;
+
+//IR Codes
+const unsigned long PLAY_PAUSE   = 0xFF02FD;
+const unsigned long FAST_FORWARD = 0xFFC23D;
+const unsigned long REWIND       = 0xFF22DD;
+unsigned long FUNC_STOP = 0xFFE21D;
+const unsigned long NUM0 = 0xFF6897;
+const unsigned long NUM1 = 0xFF30CF;
+const unsigned long NUM2 = 0xFF18E7;
+const unsigned long NUM3 = 0xFF7A85;
+const unsigned long NUM4 = 0xFF10EF;
+const unsigned long NUM5 = 0xFF38C7;
+const unsigned long NUM6 = 0xFF5AA5;
+const unsigned long NUM7 = 0xFF42BD;
+const unsigned long NUM8 = 0xFF4AB5;
+const unsigned long NUM9 = 0xFF52AD;
+
+//Variables
+volatile bool updateFlag = false;
+bool isClockwise = true;
+int lastDirectionButtonState = HIGH;
+
+bool isFanActive = false;
+int irSpeedIndex = 0;
+const int irSpeedLevels[] = {0, 100, 180, 255};
+unsigned long lastIrCode = 0;
+unsigned long lastIrTime = 0;
+
+int soundBasedPwm = 0;
+String speedLabel = "0";
+int micBaseline = 0;
+int micThresh1, micThresh2, micThresh3;
+
+unsigned long lastIrPressTime = 0;
+const unsigned long irDebounceDelay = 200;
+
+enum SystemMode { MODE_NORMAL, MODE_TIMESET };
+SystemMode systemMode = MODE_NORMAL;
+int enteredTimeDigits[6] = {0};
+int timeDigitIndex = 0;
+
+
+int readMicLevel();
+void autoCalibrateMic();
+void driveMotor(int pwmValue);
+void handleIr(unsigned long code);
+void updateLcd(String modeLabel, String speedLabel);
+int convertCodeToDigit(unsigned long code);
+
+//Setup
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(motorEnablePin, OUTPUT);
+  pinMode(motorIn1Pin, OUTPUT);
+  pinMode(motorIn2Pin, OUTPUT);
+  pinMode(directionButtonPin, INPUT_PULLUP);
+
+  lcdDisplay.begin(16, 2);
+  lcdDisplay.print("Calibrating...");
+  delay(1000);
+
+  Wire.begin();
+  if (!rtc.begin()) {
+    lcdDisplay.clear();
+    lcdDisplay.print("RTC not found!");
+    while (1);
+  }
+
+  rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+
+  autoCalibrateMic();
+  irReceiver.enableIRIn();
+
+  cli();
+  TCCR1A = 0;
+  TCCR1B = 0;
+  OCR1A = 15624;
+  TCCR1B |= (1 << WGM12);
+  TCCR1B |= (1 << CS12) | (1 << CS10);
+  TIMSK1 |= (1 << OCIE1A);
+  sei();
+
+  lcdDisplay.clear();
+  lcdDisplay.print("System Ready");
+  delay(1000);
+  lcdDisplay.clear();
+
+  updateLcd("AUTO", "0");
+}
+
+void loop() {
+  int buttonState = digitalRead(directionButtonPin);
+  if (buttonState == LOW && lastDirectionButtonState == HIGH) {
+    isClockwise = !isClockwise;
+    delay(100);
+  }
+  lastDirectionButtonState = buttonState;
+
+  if (irReceiver.decode(&irResults)) {
+    unsigned long code = irResults.value;
+
+    Serial.print("IR code received: 0x");
+    Serial.println(code, HEX);
+
+    if (code == 0xFFFFFFFF && (millis() - lastIrTime < 300)) {
+      code = lastIrCode;
+    } else if (code != 0xFFFFFFFF) {
+      lastIrCode = code;
+    }
+    lastIrTime = millis();
+
+    handleIr(code);
+    irReceiver.resume();
+  }
+
+  int finalPwm = 0;
+  String modeLabel = "";
+
+  if (systemMode == MODE_TIMESET) {
+    finalPwm = 0;
+
+    lcdDisplay.setCursor(0, 0);
+    lcdDisplay.print("Updating time");
+    lcdDisplay.setCursor(0, 1);
+    for (int i = 0; i < 6; i++) {
+      if (i < timeDigitIndex) lcdDisplay.print(enteredTimeDigits[i]);
+      else if (i == timeDigitIndex) lcdDisplay.print((millis() / 500) % 2 ? "_" : " ");
+      else lcdDisplay.print(" ");
+    }
+
+  } else if (isFanActive) {
+    finalPwm = irSpeedLevels[irSpeedIndex];
+    switch (irSpeedIndex) {
+      case 1: speedLabel = "Low"; break;
+      case 2: speedLabel = "Med"; break;
+      case 3: speedLabel = "High"; break;
+      default: speedLabel = "0"; break;
+    }
+    modeLabel = "MANUAL";
+  } else {
+    int micLevel = readMicLevel();
+    if (micLevel < micThresh1) {
+      soundBasedPwm = 0; speedLabel = "0";
+    } else if (micLevel < micThresh2) {
+      soundBasedPwm = 128; speedLabel = "1/2";
+    } else if (micLevel < micThresh3) {
+      soundBasedPwm = 192; speedLabel = "3/4";
+    } else {
+      soundBasedPwm = 255; speedLabel = "Full";
+    }
+    finalPwm = soundBasedPwm;
+    modeLabel = "AUTO";
+  }
+
+  driveMotor(finalPwm);
+
+  if (updateFlag) {
+    updateFlag = false;
+    if (systemMode == MODE_NORMAL) updateLcd(modeLabel, speedLabel);
+  }
+}
+
+//IR
+void handleIr(unsigned long code) {
+  if (millis() - lastIrPressTime < irDebounceDelay) return;
+  lastIrPressTime = millis();
+
+  if (code == FUNC_STOP && systemMode == MODE_NORMAL) {
+    systemMode = MODE_TIMESET;
+    timeDigitIndex = 0;
+    lcdDisplay.clear();
+    lcdDisplay.setCursor(0, 0);
+    lcdDisplay.print("Updating time");
+    return;
+  }
+
+  if (systemMode == MODE_TIMESET) {
+    int num = convertCodeToDigit(code);
+    if (num >= 0 && timeDigitIndex < 6) enteredTimeDigits[timeDigitIndex++] = num;
+
+    if (timeDigitIndex >= 6) {
+      int hh = enteredTimeDigits[0] * 10 + enteredTimeDigits[1];
+      int mm = enteredTimeDigits[2] * 10 + enteredTimeDigits[3];
+      int ss = enteredTimeDigits[4] * 10 + enteredTimeDigits[5];
+      DateTime now = rtc.now();
+      rtc.adjust(DateTime(now.year(), now.month(), now.day(), hh, mm, ss));
+
+      lcdDisplay.clear();
+      lcdDisplay.print("Time Set!");
+      delay(2000);
+      lcdDisplay.clear();
+      systemMode = MODE_NORMAL;
+    }
+    return;
+  }
+
+  if (code == PLAY_PAUSE) {
+    isFanActive = !isFanActive;
+    if (isFanActive && irSpeedIndex == 0) irSpeedIndex = 1;
+  } else if (code == FAST_FORWARD) {
+    if (irSpeedIndex < 3) irSpeedIndex++;
+    isFanActive = true;
+  } else if (code == REWIND) {
+    if (irSpeedIndex > 0) irSpeedIndex--;
+    if (irSpeedIndex == 0) isFanActive = false;
+  }
+}
+
+//Digits
+int convertCodeToDigit(unsigned long code) {
+  switch (code) {
+    case NUM0: return 0; 
+    case NUM1: return 1; 
+    case NUM2: return 2;
+    case NUM3: return 3; 
+    case NUM4: return 4; 
+    case NUM5: return 5;
+    case NUM6: return 6; 
+    case NUM7: return 7; 
+    case NUM8: return 8;
+    case NUM9: return 9;
+  }
+  return -1;
+}
+
+//Motor
+void driveMotor(int pwmValue) {
+  if (pwmValue == 0) {
+    analogWrite(motorEnablePin, 0);
+    digitalWrite(motorIn1Pin, LOW);
+    digitalWrite(motorIn2Pin, LOW);
+  } else {
+    analogWrite(motorEnablePin, pwmValue);
+    if (isClockwise) {
+      digitalWrite(motorIn1Pin, HIGH);
+      digitalWrite(motorIn2Pin, LOW);
+    } else {
+      digitalWrite(motorIn1Pin, LOW);
+      digitalWrite(motorIn2Pin, HIGH);
+    }
+  }
+}
+
+//Sound
+int readMicLevel() {
+  const int samples = 10;
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(micAnalogPin);
+    delay(2);
+  }
+  int avg = sum / samples;
+
+  static float smoothed = 0;
+  smoothed = (0.7 * smoothed) + (0.3 * avg);
+  return (int)smoothed;
+}
+
+void autoCalibrateMic() {
+  long total = 0;
+  const int samples = 200;
+  for (int i = 0; i < samples; i++) {
+    total += analogRead(micAnalogPin);
+    delay(10);
+  }
+  micBaseline = total / samples;
+
+  micThresh1 = micBaseline + 80;
+  micThresh2 = micBaseline + 250;
+  micThresh3 = micBaseline + 700;
+
+  lcdDisplay.clear();
+  lcdDisplay.print("Cal Done Base:");
+  lcdDisplay.setCursor(0, 1);
+  lcdDisplay.print(micBaseline);
+  delay(1500);
+  lcdDisplay.clear();
+}
+
+//LCD
+void updateLcd(String modeLabel, String speedLabel) {
+  DateTime now = rtc.now();
+  lcdDisplay.setCursor(0, 0);
+  if (now.hour() < 10) lcdDisplay.print('0'); lcdDisplay.print(now.hour()); lcdDisplay.print(":");
+  if (now.minute() < 10) lcdDisplay.print('0'); lcdDisplay.print(now.minute()); lcdDisplay.print(":");
+  if (now.second() < 10) lcdDisplay.print('0'); lcdDisplay.print(now.second());
+
+  lcdDisplay.setCursor(0, 1);
+  lcdDisplay.print(modeLabel);
+  lcdDisplay.print(" ");
+  lcdDisplay.print(isClockwise ? "C" : "CC");
+  lcdDisplay.print(" ");
+  lcdDisplay.print(speedLabel);
+  lcdDisplay.print("   ");
+}
+
+//ISR
+ISR(TIMER1_COMPA_vect) { updateFlag = true; }
 
